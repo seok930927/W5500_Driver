@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Skill(update-config)",
-      "Skill(update-config:*)"
+      "Skill(update-config:*)",
+      "Read(///wsl.localhost/Ubuntu-24.04//**)",
+      "Bash(wslpath \"\\\\\\\\wsl.localhost\\\\Ubuntu-24.04\\\\home\\\\sock\\\\W5500_Driver\\\\source\")"
     ]
   }
 }

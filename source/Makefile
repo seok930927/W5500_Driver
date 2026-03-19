@@ -1,9 +1,18 @@
 
+# Set DEBUG=1 to build debug driver (coexists with stock driver)
+# Set DEBUG=0 to build as stock driver replacement
+DEBUG ?= 1
+
+ifeq ($(DEBUG),1)
 obj-m += w5100_debug.o
 obj-m += w5100_spi_debug.o
-
 w5100_debug-objs     := w5100.o
 w5100_spi_debug-objs := w5100-spi.o
+ccflags-y            += -DW5XXX_DEBUG
+else
+obj-m += w5100.o
+obj-m += w5100_spi.o
+endif
 
 KDIR  := /lib/modules/$(shell uname -r)/build
 SRC   := $(shell pwd)

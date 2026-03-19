@@ -27,7 +27,13 @@
 
 #include "w5100.h"
 
+
+
+#ifdef W5XXX_DEBUG
 #define DRV_NAME	"w5100_debug"
+#else
+#define DRV_NAME	"w5100"
+#endif
 #define DRV_VERSION	"2012-04-04"
 
 MODULE_DESCRIPTION("WIZnet W5100 Ethernet driver v"DRV_VERSION);

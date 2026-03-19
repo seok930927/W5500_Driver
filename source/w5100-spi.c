@@ -252,6 +252,24 @@ static const struct w5100_ops w5200_ops = {
 	.init = w5200_spi_init,
 };
 
+#ifdef W5XXX_DEBUG
+#define W5SPI_DRV_NAME  "w5100_debug"
+#define W5100_SPI_ID    "w5100_debug"
+#define W5200_SPI_ID    "w5200_debug"
+#define W5500_SPI_ID    "w5500_debug"
+#define W5100_OF_COMPAT "wiznet,w5100_debug"
+#define W5200_OF_COMPAT "wiznet,w5200_debug"
+#define W5500_OF_COMPAT "wiznet,w5500_debug"
+#else
+#define W5SPI_DRV_NAME  "w5100"
+#define W5100_SPI_ID    "w5100"
+#define W5200_SPI_ID    "w5200"
+#define W5500_SPI_ID    "w5500"
+#define W5100_OF_COMPAT "wiznet,w5100"
+#define W5200_OF_COMPAT "wiznet,w5200"
+#define W5500_OF_COMPAT "wiznet,w5500"
+#endif
+
 #define W5500_SPI_BLOCK_SELECT(addr) (((addr) >> 16) & 0x1f)
 #define W5500_SPI_READ_CONTROL(addr) (W5500_SPI_BLOCK_SELECT(addr) << 3)
 #define W5500_SPI_WRITE_CONTROL(addr)	\
@@ -411,9 +429,9 @@ static const struct w5100_ops w5500_ops = {
 };
 
 static const struct of_device_id w5100_of_match[] = {
-	{ .compatible = "wiznet,w5100", .data = (const void*)W5100, },
-	{ .compatible = "wiznet,w5200", .data = (const void*)W5200, },
-	{ .compatible = "wiznet,w5500_debug", .data = (const void*)W5500, },
+	{ .compatible = W5100_OF_COMPAT, .data = (const void*)W5100, },
+	{ .compatible = W5200_OF_COMPAT, .data = (const void*)W5200, },
+	{ .compatible = W5500_OF_COMPAT, .data = (const void*)W5500, },
 	{ },
 };
 MODULE_DEVICE_TABLE(of, w5100_of_match);
@@ -459,16 +477,16 @@ static void w5100_spi_remove(struct spi_device *spi)
 }
 
 static const struct spi_device_id w5100_spi_ids[] = {
-	{ "w5100", W5100 },
-	{ "w5200", W5200 },
-	{ "w5500_debug", W5500 },
+	{ W5100_SPI_ID, W5100 },
+	{ W5200_SPI_ID, W5200 },
+	{ W5500_SPI_ID, W5500 },
 	{}
 };
 MODULE_DEVICE_TABLE(spi, w5100_spi_ids);
 
 static struct spi_driver w5100_spi_driver = {
 	.driver		= {
-		.name	= "w5100_debug",
+		.name	= W5SPI_DRV_NAME,
 		.pm	= &w5100_pm_ops,
 		.of_match_table = w5100_of_match,
 	},
