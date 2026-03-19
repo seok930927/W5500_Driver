@@ -173,6 +173,7 @@ struct w5100_priv {
 
 	u8 *rx_buf;
 	u16 rx_partial; /* 이전 배치에서 저장된 partial packet 바이트 수 */
+	u16 rx_rd;      /* W5100_S0_RX_RD 로컬 캐시 — SPI 읽기 제거용 */
 };
 
 /************************************************************************
@@ -711,6 +712,8 @@ static void w5100_hw_start(struct w5100_priv *priv)
 
 	w5100_write(priv, W5100_S0_MR(priv), mode);
 	w5100_command(priv, S0_CR_OPEN);
+	/* 소켓 오픈 후 RX_RD 포인터를 한 번만 읽어 캐시. 이후 로컬에서 추적. */
+	priv->rx_rd = w5100_read16(priv, W5100_S0_RX_RD(priv));
 	w5100_enable_intr(priv);
 }
 
@@ -857,11 +860,9 @@ static int w5100_rx_batch(struct net_device *ndev, int budget, bool napi)
 	u8 *ptr, *end;
 	int rx_count = 0;
 
-	/* W5500 데이터시트: RSR은 내부 카운터 업데이트 중 읽으면 불일치 가능.
-	 * 두 번 읽어 같은 값일 때만 사용. */
-	do {
-		new_len = w5100_read16(priv, W5100_S0_RX_RSR(priv));
-	} while (new_len != w5100_read16(priv, W5100_S0_RX_RSR(priv)));
+	/* 인터럽트 기반 호출 — 인터럽트 발생 시점에 RSR이 이미 확정됨.
+	 * 단일 읽기로 충분. */
+	new_len = w5100_read16(priv, W5100_S0_RX_RSR(priv));
 
 	if (new_len == 0 && priv->rx_partial == 0)
 		return 0;
@@ -871,7 +872,8 @@ static int w5100_rx_batch(struct net_device *ndev, int budget, bool napi)
 		new_len = priv->s0_rx_buf_size - priv->rx_partial;
 
 	if (new_len > 0) {
-		offset = w5100_read16(priv, W5100_S0_RX_RD(priv));
+		/* RX_RD는 로컬 캐시 사용 — SPI 읽기 불필요 */
+		offset = priv->rx_rd;
 
 		/* 이전 배치의 partial bytes 뒤에 이어서 읽기 */
 		if (w5100_readbuf(priv, offset, priv->rx_buf + priv->rx_partial, new_len))
@@ -881,7 +883,8 @@ static int w5100_rx_batch(struct net_device *ndev, int budget, bool napi)
 		 * 파싱은 CPU 메모리(rx_buf)에서 하므로 W5500 버퍼를 기다릴 필요 없음.
 		 * 이로 인해 새 패킷이 버퍼 오버플로우 없이 도착 가능.
 		 */
-		w5100_write16(priv, W5100_S0_RX_RD(priv), offset + new_len);
+		priv->rx_rd = offset + new_len;
+		w5100_write16(priv, W5100_S0_RX_RD(priv), priv->rx_rd);
 		w5100_command(priv, S0_CR_RECV);
 	}
 
