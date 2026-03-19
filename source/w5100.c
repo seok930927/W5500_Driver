@@ -172,6 +172,7 @@ struct w5100_priv {
 	struct work_struct restart_work;
 
 	u8 *rx_buf;
+	u16 rx_partial; /* 이전 배치에서 저장된 partial packet 바이트 수 */
 };
 
 /************************************************************************
@@ -577,12 +578,19 @@ static int w5100_command(struct w5100_priv *priv, u16 cmd)
 
 	w5100_write(priv, W5100_S0_CR(priv), cmd);
 
+	/* W5500 RECV는 즉각 처리되므로 폴링 불필요 */
+	if (priv->ops->chip_id == W5500 && cmd == S0_CR_RECV)
+		return 0;
+
 	timeout = jiffies + msecs_to_jiffies(100);
 
 	while (w5100_read(priv, W5100_S0_CR(priv)) != 0) {
 		if (time_after(jiffies, timeout))
 			return -EIO;
-		cpu_relax();
+		if (priv->ops->may_sleep)
+			usleep_range(10, 20);
+		else
+			cpu_relax();
 	}
 
 	return 0;
@@ -845,24 +853,46 @@ static netdev_tx_t w5100_start_tx(struct sk_buff *skb, struct net_device *ndev)
 static int w5100_rx_batch(struct net_device *ndev, int budget, bool napi)
 {
 	struct w5100_priv *priv = netdev_priv(ndev);
-	u16 total_len, offset;
+	u16 new_len, offset;
 	u8 *ptr, *end;
 	int rx_count = 0;
 
-	total_len = w5100_read16(priv, W5100_S0_RX_RSR(priv));
-	if (total_len == 0)
+	/* W5500 데이터시트: RSR은 내부 카운터 업데이트 중 읽으면 불일치 가능.
+	 * 두 번 읽어 같은 값일 때만 사용. */
+	do {
+		new_len = w5100_read16(priv, W5100_S0_RX_RSR(priv));
+	} while (new_len != w5100_read16(priv, W5100_S0_RX_RSR(priv)));
+
+	if (new_len == 0 && priv->rx_partial == 0)
 		return 0;
 
-	if (total_len > priv->s0_rx_buf_size)
-		total_len = priv->s0_rx_buf_size;
+	/* rx_buf 공간 초과 방지 (rx_partial 공간 확보) */
+	if (new_len > priv->s0_rx_buf_size - priv->rx_partial)
+		new_len = priv->s0_rx_buf_size - priv->rx_partial;
 
-	offset = w5100_read16(priv, W5100_S0_RX_RD(priv));
+	if (new_len > 0) {
+		offset = w5100_read16(priv, W5100_S0_RX_RD(priv));
 
-	if (w5100_readbuf(priv, offset, priv->rx_buf, total_len))
-		return 0;
+		/* 이전 배치의 partial bytes 뒤에 이어서 읽기 */
+		if (w5100_readbuf(priv, offset, priv->rx_buf + priv->rx_partial, new_len))
+			return 0;
+
+		/* SPI 읽기 완료 즉시 W5500 버퍼 해제.
+		 * 파싱은 CPU 메모리(rx_buf)에서 하므로 W5500 버퍼를 기다릴 필요 없음.
+		 * 이로 인해 새 패킷이 버퍼 오버플로우 없이 도착 가능.
+		 */
+		w5100_write16(priv, W5100_S0_RX_RD(priv), offset + new_len);
+		w5100_command(priv, S0_CR_RECV);
+	}
 
 	ptr = priv->rx_buf;
-	end = priv->rx_buf + total_len;
+	end = priv->rx_buf + priv->rx_partial + new_len;
+
+	/* process context에서 netif_receive_skb 호출 시 BH 비활성화 필요.
+	 * NAPI poll(softirq context)에서는 이미 BH 비활성화 상태.
+	 */
+	if (napi && !in_softirq())
+		local_bh_disable();
 
 	while (ptr + 2 <= end && rx_count < budget) {
 		u16 pkt_total = get_unaligned_be16(ptr);
@@ -870,13 +900,13 @@ static int w5100_rx_batch(struct net_device *ndev, int budget, bool napi)
 		struct sk_buff *skb;
 
 		if (pkt_total < 2) {
-			netdev_err(ndev, "rx: corrupted packet header: pkt_total=%u offset=%zu total_len=%u\n",
-				   pkt_total, ptr - priv->rx_buf, total_len);
+			netdev_err(ndev, "rx: corrupted packet header: pkt_total=%u offset=%zu\n",
+				   pkt_total, ptr - priv->rx_buf);
 			ptr = end;
 			break;
 		}
 		if (ptr + pkt_total > end)
-			break;  /* 배치 끝에 걸친 패킷 — 다음 인터럽트에서 처리 */
+			break;  /* partial packet — 다음 호출에서 처리 */
 
 		rx_len = pkt_total - 2;
 
@@ -903,9 +933,18 @@ static int w5100_rx_batch(struct net_device *ndev, int budget, bool napi)
 		rx_count++;
 	}
 
-	w5100_write16(priv, W5100_S0_RX_RD(priv),
-		      offset + (u16)(ptr - priv->rx_buf));
-	w5100_command(priv, S0_CR_RECV);
+	if (napi && !in_softirq())
+		local_bh_enable();
+
+	/* 미처리 데이터(partial packet 포함)를 rx_buf 앞으로 이동하여 저장 */
+	if (ptr < end) {
+		u16 leftover = end - ptr;
+
+		memmove(priv->rx_buf, ptr, leftover);
+		priv->rx_partial = leftover;
+	} else {
+		priv->rx_partial = 0;
+	}
 
 	return rx_count;
 }
@@ -915,7 +954,9 @@ static void w5100_rx_work(struct work_struct *work)
 	struct w5100_priv *priv = container_of(work, struct w5100_priv,
 					       rx_work);
 
-	w5100_rx_batch(priv->ndev, INT_MAX, false);
+	while (w5100_rx_batch(priv->ndev, INT_MAX, false) > 0)
+		;
+
 	w5100_enable_intr(priv);
 }
 
@@ -1172,7 +1213,7 @@ int w5100_probe(struct device *dev, const struct w5100_ops *ops,
 	if (err < 0)
 		goto err_register;
 
-	priv->xfer_wq = alloc_workqueue("%s", WQ_MEM_RECLAIM, 0,
+	priv->xfer_wq = alloc_workqueue("%s", WQ_MEM_RECLAIM | WQ_HIGHPRI, 0,
 					netdev_name(ndev));
 	if (!priv->xfer_wq) {
 		err = -ENOMEM;

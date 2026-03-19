@@ -12,15 +12,15 @@ BUILD := $(SRC)/build
 all: modules dtbo
 
 modules:
-        $(MAKE) -C $(KDIR) M=$(SRC) modules
-        mkdir -p $(BUILD)
-        mv $(SRC)/*.ko $(SRC)/*.o $(SRC)/*.mod $(SRC)/*.mod.c \
-                $(SRC)/modules.order $(SRC)/Module.symvers $(BUILD)/ 2>/dev/null || true
-        find $(SRC) -maxdepth 1 \( -name ".*.cmd" -o -name ".*.d" \) -delete
+	$(MAKE) -C $(KDIR) M=$(SRC) modules
+	mkdir -p $(BUILD)
+	mv $(SRC)/*.ko $(SRC)/*.o $(SRC)/*.mod $(SRC)/*.mod.c \
+		$(SRC)/modules.order $(SRC)/Module.symvers $(BUILD)/ 2>/dev/null || true
+	find $(SRC) -maxdepth 1 \( -name ".*.cmd" -o -name ".*.d" \) -delete
 
 dtbo:
-        dtc -I dts -O dtb -o $(BUILD)/w5500-debug.dtbo $(SRC)/w5500-overlay.dts
+	dtc -I dts -O dtb -o $(BUILD)/w5500-debug.dtbo $(SRC)/w5500-overlay.dts
 
 clean:
-        rm -rf $(BUILD)
-        $(MAKE) -C $(KDIR) M=$(SRC) clean
+	rm -rf $(BUILD)
+	$(MAKE) -C $(KDIR) M=$(SRC) clean
