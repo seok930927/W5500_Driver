@@ -27,7 +27,7 @@
 
 #include "w5100.h"
 
-#define DRV_NAME	"w5100"
+#define DRV_NAME	"w5100_debug"
 #define DRV_VERSION	"2012-04-04"
 
 MODULE_DESCRIPTION("WIZnet W5100 Ethernet driver v"DRV_VERSION);
@@ -170,6 +170,8 @@ struct w5100_priv {
 	struct work_struct tx_work;
 	struct work_struct setrx_work;
 	struct work_struct restart_work;
+
+	u8 *rx_buf;
 };
 
 /************************************************************************
@@ -840,51 +842,80 @@ static netdev_tx_t w5100_start_tx(struct sk_buff *skb, struct net_device *ndev)
 	return NETDEV_TX_OK;
 }
 
-static struct sk_buff *w5100_rx_skb(struct net_device *ndev)
+static int w5100_rx_batch(struct net_device *ndev, int budget, bool napi)
 {
 	struct w5100_priv *priv = netdev_priv(ndev);
-	struct sk_buff *skb;
-	u16 rx_len;
-	u16 offset;
-	u8 header[2];
-	u16 rx_buf_len = w5100_read16(priv, W5100_S0_RX_RSR(priv));
+	u16 total_len, offset;
+	u8 *ptr, *end;
+	int rx_count = 0;
 
-	if (rx_buf_len == 0)
-		return NULL;
+	total_len = w5100_read16(priv, W5100_S0_RX_RSR(priv));
+	if (total_len == 0)
+		return 0;
+
+	if (total_len > priv->s0_rx_buf_size)
+		total_len = priv->s0_rx_buf_size;
 
 	offset = w5100_read16(priv, W5100_S0_RX_RD(priv));
-	w5100_readbuf(priv, offset, header, 2);
-	rx_len = get_unaligned_be16(header) - 2;
 
-	skb = netdev_alloc_skb_ip_align(ndev, rx_len);
-	if (unlikely(!skb)) {
-		w5100_write16(priv, W5100_S0_RX_RD(priv), offset + rx_buf_len);
-		w5100_command(priv, S0_CR_RECV);
-		ndev->stats.rx_dropped++;
-		return NULL;
+	if (w5100_readbuf(priv, offset, priv->rx_buf, total_len))
+		return 0;
+
+	ptr = priv->rx_buf;
+	end = priv->rx_buf + total_len;
+
+	while (ptr + 2 <= end && rx_count < budget) {
+		u16 pkt_total = get_unaligned_be16(ptr);
+		u16 rx_len;
+		struct sk_buff *skb;
+
+		if (pkt_total < 2) {
+			netdev_err(ndev, "rx: corrupted packet header: pkt_total=%u offset=%zu total_len=%u\n",
+				   pkt_total, ptr - priv->rx_buf, total_len);
+			ptr = end;
+			break;
+		}
+		if (ptr + pkt_total > end)
+			break;  /* 배치 끝에 걸친 패킷 — 다음 인터럽트에서 처리 */
+
+		rx_len = pkt_total - 2;
+
+		skb = netdev_alloc_skb_ip_align(ndev, rx_len);
+		if (unlikely(!skb)) {
+			ndev->stats.rx_dropped++;
+			ptr += pkt_total;
+			continue;
+		}
+
+		skb_put(skb, rx_len);
+		memcpy(skb->data, ptr + 2, rx_len);
+		skb->protocol = eth_type_trans(skb, ndev);
+
+		ndev->stats.rx_packets++;
+		ndev->stats.rx_bytes += rx_len;
+
+		if (napi)
+			netif_receive_skb(skb);
+		else
+			netif_rx(skb);
+
+		ptr += pkt_total;
+		rx_count++;
 	}
 
-	skb_put(skb, rx_len);
-	w5100_readbuf(priv, offset + 2, skb->data, rx_len);
-	w5100_write16(priv, W5100_S0_RX_RD(priv), offset + 2 + rx_len);
+	w5100_write16(priv, W5100_S0_RX_RD(priv),
+		      offset + (u16)(ptr - priv->rx_buf));
 	w5100_command(priv, S0_CR_RECV);
-	skb->protocol = eth_type_trans(skb, ndev);
 
-	ndev->stats.rx_packets++;
-	ndev->stats.rx_bytes += rx_len;
-
-	return skb;
+	return rx_count;
 }
 
 static void w5100_rx_work(struct work_struct *work)
 {
 	struct w5100_priv *priv = container_of(work, struct w5100_priv,
 					       rx_work);
-	struct sk_buff *skb;
 
-	while ((skb = w5100_rx_skb(priv->ndev)))
-		netif_rx(skb);
-
+	w5100_rx_batch(priv->ndev, INT_MAX, false);
 	w5100_enable_intr(priv);
 }
 
@@ -893,14 +924,7 @@ static int w5100_napi_poll(struct napi_struct *napi, int budget)
 	struct w5100_priv *priv = container_of(napi, struct w5100_priv, napi);
 	int rx_count;
 
-	for (rx_count = 0; rx_count < budget; rx_count++) {
-		struct sk_buff *skb = w5100_rx_skb(priv->ndev);
-
-		if (skb)
-			netif_receive_skb(skb);
-		else
-			break;
-	}
+	rx_count = w5100_rx_batch(priv->ndev, budget, true);
 
 	if (rx_count < budget) {
 		napi_complete_done(napi, rx_count);
@@ -1124,6 +1148,12 @@ int w5100_probe(struct device *dev, const struct w5100_ops *ops,
 		goto err_register;
 	}
 
+	priv->rx_buf = kmalloc(priv->s0_rx_buf_size, GFP_KERNEL);
+	if (!priv->rx_buf) {
+		err = -ENOMEM;
+		goto err_register;
+	}
+
 	priv->ndev = ndev;
 	priv->ops = ops;
 	priv->irq = irq;
@@ -1142,7 +1172,7 @@ int w5100_probe(struct device *dev, const struct w5100_ops *ops,
 	if (err < 0)
 		goto err_register;
 
-	priv->xfer_wq = alloc_workqueue("%s", WQ_MEM_RECLAIM | WQ_PERCPU, 0,
+	priv->xfer_wq = alloc_workqueue("%s", WQ_MEM_RECLAIM, 0,
 					netdev_name(ndev));
 	if (!priv->xfer_wq) {
 		err = -ENOMEM;
@@ -1205,6 +1235,7 @@ err_hw:
 err_wq:
 	unregister_netdev(ndev);
 err_register:
+	kfree(priv->rx_buf);
 	free_netdev(ndev);
 	return err;
 }
@@ -1215,6 +1246,7 @@ void w5100_remove(struct device *dev)
 	struct net_device *ndev = dev_get_drvdata(dev);
 	struct w5100_priv *priv = netdev_priv(ndev);
 
+	kfree(priv->rx_buf);
 	w5100_hw_reset(priv);
 	free_irq(priv->irq, ndev);
 	if (gpio_is_valid(priv->link_gpio))
