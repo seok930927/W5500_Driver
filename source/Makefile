@@ -24,7 +24,8 @@ all: modules dtbo
 modules:
 	$(MAKE) -C $(KDIR) M=$(SRC) modules
 	mkdir -p $(BUILD)
-	mv $(SRC)/*.ko $(SRC)/*.o $(SRC)/*.mod $(SRC)/*.mod.c \
+	mv $(SRC)/*.ko $(BUILD)/
+	mv $(SRC)/*.o $(SRC)/*.mod $(SRC)/*.mod.c \
 		$(SRC)/modules.order $(SRC)/Module.symvers $(BUILD)/ 2>/dev/null || true
 	find $(SRC) -maxdepth 1 \( -name ".*.cmd" -o -name ".*.d" \) -delete
 

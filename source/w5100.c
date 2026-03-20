@@ -889,6 +889,13 @@ static int w5100_rx_batch(struct net_device *ndev, int budget, bool napi)
 		priv->rx_rd = offset + new_len;
 		w5100_write16(priv, W5100_S0_RX_RD(priv), priv->rx_rd);
 		w5100_command(priv, S0_CR_RECV);
+
+		/* W5500 버퍼 해제 직후 인터럽트 재활성화.
+		 * 패킷 파싱(while 루프)은 CPU 메모리에서 하므로 SPI 불필요.
+		 * 파싱하는 동안 다음 인터럽트가 미리 queue_work 해놓으면
+		 * 파싱 완료 즉시 다음 SPI 읽기 시작 — 스케줄링 갭 제거.
+		 */
+		w5100_enable_intr(priv);
 	}
 
 	ptr = priv->rx_buf;
