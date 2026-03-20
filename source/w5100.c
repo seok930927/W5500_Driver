@@ -873,9 +873,6 @@ static int w5100_rx_batch(struct net_device *ndev, int budget, bool napi)
 	if (new_len == 0 && priv->rx_partial == 0)
 		return 0;
 
-	/* rx_buf 공간 초과 방지 (rx_partial 공간 확보) */
-	if (new_len > priv->s0_rx_buf_size - priv->rx_partial)
-		new_len = priv->s0_rx_buf_size - priv->rx_partial;
 
 	if (new_len > 0) {
 		/* RX_RD는 로컬 캐시 사용 — SPI 읽기 불필요 */
@@ -1198,7 +1195,7 @@ int w5100_probe(struct device *dev, const struct w5100_ops *ops,
 		goto err_register;
 	}
 
-	priv->rx_buf = kmalloc(priv->s0_rx_buf_size, GFP_KERNEL);
+	priv->rx_buf = kmalloc(priv->s0_rx_buf_size * 2, GFP_KERNEL);
 	if (!priv->rx_buf) {
 		err = -ENOMEM;
 		goto err_register;
