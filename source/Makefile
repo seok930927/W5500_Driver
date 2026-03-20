@@ -12,6 +12,7 @@ ccflags-y            += -DW5XXX_DEBUG
 else
 obj-m += w5100.o
 obj-m += w5100_spi.o
+w5100_spi-objs := w5100-spi.o
 endif
 
 KDIR  := /lib/modules/$(shell uname -r)/build
