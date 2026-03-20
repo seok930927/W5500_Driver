@@ -95,10 +95,12 @@ read -p "  Proceed with backup? (y/N): " confirm_backup
 
 if [ -f "$WIZNET_DIR/w5100.ko.xz" ]; then
     sudo cp "$WIZNET_DIR/w5100.ko.xz" "$WIZNET_DIR/w5100.ko.xz.bak"
+    sudo rm "$WIZNET_DIR/w5100.ko.xz"
     echo "  Backed up: w5100.ko.xz -> w5100.ko.xz.bak"
 fi
 if [ -f "$WIZNET_DIR/w5100-spi.ko.xz" ]; then
     sudo cp "$WIZNET_DIR/w5100-spi.ko.xz" "$WIZNET_DIR/w5100-spi.ko.xz.bak"
+    sudo rm "$WIZNET_DIR/w5100-spi.ko.xz"
     echo "  Backed up: w5100-spi.ko.xz -> w5100-spi.ko.xz.bak"
 fi
 
