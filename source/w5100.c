@@ -180,6 +180,8 @@ struct w5100_priv {
 	u8 *rx_buf;
 	u16 rx_partial; /* 이전 배치에서 저장된 partial packet 바이트 수 */
 	u16 rx_rd;      /* W5100_S0_RX_RD 로컬 캐시 — SPI 읽기 제거용 */
+
+	struct sk_buff *skb_list[256];
 };
 
 /************************************************************************
@@ -861,105 +863,72 @@ static netdev_tx_t w5100_start_tx(struct sk_buff *skb, struct net_device *ndev)
 
 static int w5100_rx_batch(struct net_device *ndev, int budget, bool napi)
 {
-	struct w5100_priv *priv = netdev_priv(ndev);
-	u16 new_len, offset;
-	u8 *ptr, *end;
-	int rx_count = 0;
+    struct w5100_priv *priv = netdev_priv(ndev);
+    int rx_count = 0;
+    int skb_idx = 0;
+    int i;
+    u16 max_local_buf = priv->s0_rx_buf_size * 2; 
 
-	/* 인터럽트 기반 호출 — 인터럽트 발생 시점에 RSR이 이미 확정됨.
-	 * 단일 읽기로 충분. */
-	new_len = w5100_read16(priv, W5100_S0_RX_RSR(priv));
+    if (napi && !in_softirq())
+        local_bh_disable();
 
-	if (new_len == 0 && priv->rx_partial == 0)
-		return 0;
+    /* 1. 하드웨어 데이터 수집 */
+    while (rx_count < budget && skb_idx < 256) {
+        u16 new_len = w5100_read16(priv, W5100_S0_RX_RSR(priv));
+        if (new_len == 0 || (priv->rx_partial + new_len) > max_local_buf)
+            break;
 
+        if (w5100_readbuf(priv, priv->rx_rd, priv->rx_buf + priv->rx_partial, new_len))
+            break;
 
-	if (new_len > 0) {
-		/* RX_RD는 로컬 캐시 사용 — SPI 읽기 불필요 */
-		offset = priv->rx_rd;
+        priv->rx_rd += new_len;
+        w5100_write16(priv, W5100_S0_RX_RD(priv), priv->rx_rd);
+        w5100_command(priv, S0_CR_RECV);
+        priv->rx_partial += new_len;
 
-		/* 이전 배치의 partial bytes 뒤에 이어서 읽기 */
-		if (w5100_readbuf(priv, offset, priv->rx_buf + priv->rx_partial, new_len))
-			return 0;
+        u8 *ptr = priv->rx_buf;
+        u8 *end = priv->rx_buf + priv->rx_partial;
 
-		/* SPI 읽기 완료 즉시 W5500 버퍼 해제.
-		 * 파싱은 CPU 메모리(rx_buf)에서 하므로 W5500 버퍼를 기다릴 필요 없음.
-		 * 이로 인해 새 패킷이 버퍼 오버플로우 없이 도착 가능.
-		 */
-		priv->rx_rd = offset + new_len;
-		w5100_write16(priv, W5100_S0_RX_RD(priv), priv->rx_rd);
-		w5100_command(priv, S0_CR_RECV);
+        while (ptr + 2 <= end && rx_count < budget && skb_idx < 256) {
+            u16 pkt_total = get_unaligned_be16(ptr);
+            if (unlikely(pkt_total < 2)) {
+                priv->rx_partial = 0;
+                goto out;
+            }
+            if (ptr + pkt_total > end) break; 
 
-		/* W5500 버퍼 해제 직후 인터럽트 재활성화.
-		 * 패킷 파싱(while 루프)은 CPU 메모리에서 하므로 SPI 불필요.
-		 * 파싱하는 동안 다음 인터럽트가 미리 queue_work 해놓으면
-		 * 파싱 완료 즉시 다음 SPI 읽기 시작 — 스케줄링 갭 제거.
-		 */
-		w5100_enable_intr(priv);
-	}
+            u16 rx_len = pkt_total - 2;
+            struct sk_buff *skb = netdev_alloc_skb_ip_align(ndev, rx_len);
+            if (likely(skb)) {
+                memcpy(skb_put(skb, rx_len), ptr + 2, rx_len);
+                skb->protocol = eth_type_trans(skb, ndev);
+                ndev->stats.rx_packets++;
+                ndev->stats.rx_bytes += rx_len;
+                priv->skb_list[skb_idx++] = skb; // 스택 대신 priv(힙)에 저장
+            }
+            ptr += pkt_total;
+            rx_count++;
+        }
+        u16 leftover = end - ptr;
+        if (leftover > 0 && ptr != priv->rx_buf) memmove(priv->rx_buf, ptr, leftover);
+        priv->rx_partial = leftover;
+    }
 
-	ptr = priv->rx_buf;
-	end = priv->rx_buf + priv->rx_partial + new_len;
+out:
+    /* 2. 일괄 보고 (Batch Push) */
+    for (i = 0; i < skb_idx; i++) {
+        if (napi) 
+            // skb_list[i]가 아니라 priv->skb_list[i] 입니다!
+            napi_gro_receive(&priv->napi, priv->skb_list[i]);
+        else 
+            // 여기도 priv->를 붙여주세요
+            netif_rx(priv->skb_list[i]);
+    }
 
-	/* process context에서 netif_receive_skb 호출 시 BH 비활성화 필요.
-	 * NAPI poll(softirq context)에서는 이미 BH 비활성화 상태.
-	 */
-	if (napi && !in_softirq())
-		local_bh_disable();
+    if (napi && !in_softirq()) 
+        local_bh_enable();
 
-	while (ptr + 2 <= end && rx_count < budget) {
-		u16 pkt_total = get_unaligned_be16(ptr);
-		u16 rx_len;
-		struct sk_buff *skb;
-
-		if (pkt_total < 2) {
-			netdev_err(ndev, "rx: corrupted packet header: pkt_total=%u offset=%zu\n",
-				   pkt_total, ptr - priv->rx_buf);
-			ptr = end;
-			break;
-		}
-		if (ptr + pkt_total > end)
-			break;  /* partial packet — 다음 호출에서 처리 */
-
-		rx_len = pkt_total - 2;
-
-		skb = netdev_alloc_skb_ip_align(ndev, rx_len);
-		if (unlikely(!skb)) {
-			ndev->stats.rx_dropped++;
-			ptr += pkt_total;
-			continue;
-		}
-
-		skb_put(skb, rx_len);
-		memcpy(skb->data, ptr + 2, rx_len);
-		skb->protocol = eth_type_trans(skb, ndev);
-
-		ndev->stats.rx_packets++;
-		ndev->stats.rx_bytes += rx_len;
-
-		if (napi)
-			netif_receive_skb(skb);
-		else
-			netif_rx(skb);
-
-		ptr += pkt_total;
-		rx_count++;
-	}
-
-	if (napi && !in_softirq())
-		local_bh_enable();
-
-	/* 미처리 데이터(partial packet 포함)를 rx_buf 앞으로 이동하여 저장 */
-	if (ptr < end) {
-		u16 leftover = end - ptr;
-
-		memmove(priv->rx_buf, ptr, leftover);
-		priv->rx_partial = leftover;
-	} else {
-		priv->rx_partial = 0;
-	}
-
-	return rx_count;
+    return rx_count;
 }
 
 static void w5100_rx_work(struct work_struct *work)
@@ -1215,7 +1184,7 @@ int w5100_probe(struct device *dev, const struct w5100_ops *ops,
 
 	ndev->netdev_ops = &w5100_netdev_ops;
 	ndev->ethtool_ops = &w5100_ethtool_ops;
-	netif_napi_add_weight(ndev, &priv->napi, w5100_napi_poll, 16);
+	netif_napi_add_weight(ndev, &priv->napi, w5100_napi_poll, 256);
 
 	/* This chip doesn't support VLAN packets with normal MTU,
 	 * so disable VLAN for this device.
